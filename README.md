@@ -217,6 +217,5 @@ Jain University, Bengaluru
 
 [GitHub](https://github.com/aditisprasad) · [LinkedIn](https://linkedin.com/in/aditi-prasad-678808299)
 
-```
 
 
