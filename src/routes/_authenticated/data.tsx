@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMutation, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useState, useRef } from "react";
 import { toast } from "sonner";
@@ -31,8 +31,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { importHistoryQuery, sessionQuery } from "@/lib/scm/queries";
-import { processDataImport } from "@/lib/scm/scm.functions";
+import { domainEventsQuery, importHistoryQuery, sessionQuery } from "@/lib/scm/queries";
+import {
+    previewProductSupplierMappings,
+    processDataImport,
+    retryDomainEventDelivery,
+} from "@/lib/scm/scm.functions";
 import { normalizeExcelDateToMonth } from "@/lib/scm/date-normalization";
 
 export const Route = createFileRoute("/_authenticated/data")({
@@ -58,6 +62,7 @@ export const Route = createFileRoute("/_authenticated/data")({
 const DATASETS = [
     { id: "products", label: "Product Master", hint: "SKU, Name, Category, Unit Cost, Unit Price, ABC Class, Lifecycle Stage" },
     { id: "suppliers", label: "Supplier Scorecard", hint: "Code, Name, Lead Time, OTIF, Defect PPM, Risk Scores, Spend" },
+    { id: "product_suppliers", label: "Product-Supplier Mapping", hint: "SKU, Supplier Code, Unit Cost, Lead Time, MOQ, Is Primary" },
     { id: "inventory_positions", label: "Stock Positions", hint: "SKU, Site, On Hand, On Order, Allocated, Safety Stock, ROP, Daily Demand" },
     { id: "demand_history", label: "Demand History", hint: "SKU, Site, Month, Units, Revenue" },
     { id: "purchase_orders", label: "Purchase Orders", hint: "PO Number, Supplier, Site, Dates, Status, Value" },
@@ -66,12 +71,17 @@ const DATASETS = [
 
 const HEADER_ALIASES: Record<string, string[]> = {
     code: ["supplier code", "supplier_code", "suppliercode", "code"],
+    sku: ["sku", "product sku", "product code"],
+    supplier_code: ["supplier code", "supplier_code", "suppliercode"],
+    unit_cost: ["unit cost", "unit_cost", "cost"],
+    lead_time_days: ["lead time (days)", "lead time", "lead_time_days", "leadtime"],
+    moq: ["moq", "minimum order quantity", "minimum order qty"],
+    is_primary: ["is primary", "is_primary", "primary supplier", "primary"],
     name: ["supplier name", "supplier_name", "suppliername", "name"],
     category: ["category"],
     country: ["country"],
     region: ["region"],
     tier: ["tier"],
-    lead_time_days: ["lead time (days)", "lead time", "lead_time_days", "leadtime"],
     on_time_delivery_rate: ["otif %", "otif percent", "on time delivery rate", "on_time_delivery_rate", "otif"],
     defect_rate_ppm: ["defect rate (ppm)", "defect ppm", "defect rate", "defect_rate_ppm", "defect ppm"],
     financial_risk_score: ["financial risk (0-100)", "financial risk", "financial_risk_score", "financial risk score"],
@@ -114,6 +124,14 @@ const DATASET_SCHEMAS: Record<string, { field: string; label: string; required: 
         { field: "capacity_risk_score", label: "Capacity Risk (0-100)", required: true },
         { field: "annual_spend_usd", label: "Annual Spend ($)", required: true },
     ],
+    product_suppliers: [
+        { field: "sku", label: "Product SKU", required: true },
+        { field: "supplier_code", label: "Supplier Code", required: true },
+        { field: "unit_cost", label: "Relationship Unit Cost ($)", required: false },
+        { field: "lead_time_days", label: "Relationship Lead Time (Days)", required: false },
+        { field: "moq", label: "MOQ", required: true },
+        { field: "is_primary", label: "Is Primary (true/false)", required: true },
+    ],
     inventory_positions: [
         { field: "sku", label: "Product SKU", required: true },
         { field: "site_code", label: "Site Code", required: true },
@@ -155,12 +173,70 @@ const DATASET_SCHEMAS: Record<string, { field: string; label: string; required: 
     ],
 };
 
+type ProductSupplierPreview = Awaited<ReturnType<typeof previewProductSupplierMappings>>[number];
+
+function validateProductSupplierPreview(rows: ProductSupplierPreview[]) {
+    const pairCounts = new Map<string, number>();
+    const primaryCounts = new Map<string, number>();
+    for (const row of rows) {
+        const pair = `${row.sku}:${row.supplierCode}`;
+        pairCounts.set(pair, (pairCounts.get(pair) ?? 0) + 1);
+        if (String(row.isPrimary ?? "").trim().toLowerCase() === "true" || row.isPrimary === true) {
+            primaryCounts.set(row.sku, (primaryCounts.get(row.sku) ?? 0) + 1);
+        }
+    }
+
+    return rows.map((row) => {
+        const errors: string[] = [];
+        if (!row.product) errors.push(`SKU ${row.sku || "is required"} was not found in this workspace.`);
+        if (!row.supplier) errors.push(`Supplier Code ${row.supplierCode || "is required"} was not found in this workspace.`);
+        const unitCost = Number(row.relationshipUnitCost);
+        if (!Number.isFinite(unitCost) || unitCost < 0 || Math.round(unitCost * 100) !== unitCost * 100) {
+            errors.push("Relationship Unit Cost must be non-negative with no more than two decimal places.");
+        }
+        const leadTime = Number(row.relationshipLeadTimeDays);
+        if (!Number.isSafeInteger(leadTime) || leadTime < 0) {
+            errors.push("Relationship Lead Time must be a non-negative whole number of days.");
+        }
+        const moq = Number(row.moq);
+        if (row.moq === null || row.moq === undefined || row.moq === "" || !Number.isSafeInteger(moq) || moq < 0) {
+            errors.push("MOQ must be supplied as a non-negative whole number.");
+        }
+        const primaryValue = typeof row.isPrimary === "boolean"
+            ? String(row.isPrimary)
+            : String(row.isPrimary ?? "").trim().toLowerCase();
+        const booleanValues: Record<string, boolean> = {
+            true: true, yes: true, y: true, "1": true,
+            false: false, no: false, n: false, "0": false,
+        };
+        if (!(primaryValue in booleanValues)) {
+            errors.push("Is Primary must be true/false, yes/no, or 1/0.");
+        } else if (
+            booleanValues[primaryValue] &&
+            row.currentPrimarySupplier &&
+            row.currentPrimarySupplier.code !== row.supplierCode
+        ) {
+            errors.push(`A different primary supplier is already configured: ${row.currentPrimarySupplier.code}.`);
+        }
+        if ((pairCounts.get(`${row.sku}:${row.supplierCode}`) ?? 0) > 1) {
+            errors.push("This SKU and Supplier Code pair appears more than once in the file.");
+        }
+        if ((primaryCounts.get(row.sku) ?? 0) > 1) {
+            errors.push("Only one primary supplier can be selected for a product in an import.");
+        }
+        return { row: row.row, errors };
+    });
+}
+
 function DataManagementPage() {
     const { data: importHistory } = useSuspenseQuery(importHistoryQuery);
     const history = importHistory.records;
     const { data: session } = useSuspenseQuery(sessionQuery);
+    const eventQuery = useQuery(domainEventsQuery);
     const queryClient = useQueryClient();
     const runImport = useServerFn(processDataImport);
+    const retryEventDelivery = useServerFn(retryDomainEventDelivery);
+    const previewMappings = useServerFn(previewProductSupplierMappings);
 
     const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -172,6 +248,9 @@ function DataManagementPage() {
     const [parsedHeaders, setParsedHeaders] = useState<string[]>([]);
     const [parsedRows, setParsedRows] = useState<Record<string, unknown>[]>([]);
     const [mappings, setMappings] = useState<Record<string, string>>({});
+    const [mappingPreview, setMappingPreview] = useState<
+        Awaited<ReturnType<typeof previewProductSupplierMappings>> | null
+    >(null);
     const [date1904, setDate1904] = useState(false);
     const [isProcessingFile, setIsProcessingFile] = useState(false);
     const [lastImport, setLastImport] = useState<{
@@ -183,6 +262,14 @@ function DataManagementPage() {
         rowErrors: Array<{ row: number; stage: string; code?: string; message: string; details?: string; hint?: string }>;
     } | null>(null);
     const [historyErrors, setHistoryErrors] = useState<Record<string, Array<{ row: number; stage: string; code?: string; message: string; details?: string; hint?: string }>>>({});
+    const retryEventsMutation = useMutation({
+        mutationFn: () => retryEventDelivery(),
+        onSuccess: async (result) => {
+            await queryClient.invalidateQueries({ queryKey: ["scm", "domain-events"] });
+            toast.success(`Retried delivery for ${num(result.attempted)} event(s).`);
+        },
+        onError: (error: Error) => toast.error(`Event retry failed: ${error.message}`),
+    });
 
     const importMutation = useMutation({
         mutationFn: (data: { dataset: string; filename: string; rows: Record<string, unknown>[] }) =>
@@ -213,6 +300,14 @@ function DataManagementPage() {
         },
         onError: (error: Error) => toast.error(`Import failed: ${error.message}`),
         onSettled: () => queryClient.invalidateQueries({ queryKey: ["scm"] }),
+    });
+    const mappingPreviewMutation = useMutation({
+        mutationFn: (rows: Record<string, unknown>[]) => previewMappings({ data: { rows } }),
+        onSuccess: (result) => {
+            setMappingPreview(result);
+            setStep(3);
+        },
+        onError: (error: Error) => toast.error(`Unable to resolve workspace mappings: ${error.message}`),
     });
 
     function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
@@ -253,6 +348,7 @@ function DataManagementPage() {
                 const headers = Object.keys(data[0]);
                 setParsedHeaders(headers);
                 setParsedRows(data);
+                setMappingPreview(null);
 
                 // Auto-map headers to schema fields while tolerating display labels and CSV aliases.
                 const schema = DATASET_SCHEMAS[selectedDataset] || [];
@@ -275,11 +371,8 @@ function DataManagementPage() {
         reader.readAsBinaryString(selectedFile);
     }
 
-    function executeImport() {
-        if (!file || parsedRows.length === 0) return;
-
-        // Transform rows based on mapping
-        const mappedRows = parsedRows.map((row) => {
+    function getMappedRows() {
+        return parsedRows.map((row) => {
             const result: Record<string, unknown> = {};
             Object.entries(mappings).forEach(([targetField, sourceHeader]) => {
                 if (sourceHeader && row[sourceHeader] !== undefined) {
@@ -291,11 +384,23 @@ function DataManagementPage() {
             });
             return result;
         });
+    }
+
+    function continueToReview() {
+        if (selectedDataset === "product_suppliers") {
+            mappingPreviewMutation.mutate(getMappedRows());
+            return;
+        }
+        setStep(3);
+    }
+
+    function executeImport() {
+        if (!file || parsedRows.length === 0) return;
 
         importMutation.mutate({
             dataset: selectedDataset,
             filename: file.name,
-            rows: mappedRows,
+            rows: getMappedRows(),
         });
     }
 
@@ -311,6 +416,10 @@ function DataManagementPage() {
             (missingRequired.length === 0 ? 60 : 30),
         ),
     );
+    const productSupplierValidation = selectedDataset === "product_suppliers" && mappingPreview
+        ? validateProductSupplierPreview(mappingPreview)
+        : [];
+    const invalidProductSupplierRows = productSupplierValidation.filter((item) => item.errors.length > 0);
 
     return (
         <>
@@ -403,6 +512,32 @@ function DataManagementPage() {
                                             </div>
                                         ))}
                                     </div>
+                                    {selectedDataset === "product_suppliers" && (
+                                        <div className="space-y-2 rounded-lg border border-primary/20 bg-primary/5 p-3">
+                                            <p className="text-[11px] leading-relaxed text-muted-foreground">
+                                                Relationship cost, lead time, and MOQ are stored on the product-supplier record used for purchase orders. Blank cost and lead time use Product Master and Supplier Scorecard values; they never overwrite those master records. MOQ must be supplied from an approved source. A product can have only one primary supplier; replacing an existing primary is not automatic.
+                                            </p>
+                                            <Button
+                                                type="button"
+                                                variant="outline"
+                                                size="sm"
+                                                className="gap-2"
+                                                onClick={() => {
+                                                    const csv = "SKU,Supplier Code,Unit Cost,Lead Time (Days),MOQ,Is Primary\r\n";
+                                                    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+                                                    const url = URL.createObjectURL(blob);
+                                                    const link = document.createElement("a");
+                                                    link.href = url;
+                                                    link.download = "product-supplier-mapping-template.csv";
+                                                    link.click();
+                                                    URL.revokeObjectURL(url);
+                                                }}
+                                            >
+                                                <Download className="size-3.5" />
+                                                Download CSV Template
+                                            </Button>
+                                        </div>
+                                    )}
                                 </div>
 
                                 <div className="md:col-span-2 flex flex-col justify-center">
@@ -443,12 +578,12 @@ function DataManagementPage() {
                             description={`File: ${file?.name} · Dataset: ${DATASETS.find((d) => d.id === selectedDataset)?.label}`}
                             actions={
                                 <Button
-                                    onClick={() => setStep(3)}
-                                    disabled={missingRequired.length > 0}
+                                    onClick={continueToReview}
+                                    disabled={missingRequired.length > 0 || mappingPreviewMutation.isPending}
                                     size="sm"
                                     className="gap-2 bg-primary font-medium text-primary-foreground"
                                 >
-                                    Continue to Quality Review
+                                    {mappingPreviewMutation.isPending ? "Resolving Workspace Records…" : "Continue to Quality Review"}
                                     <ArrowRight className="size-4" />
                                 </Button>
                             }
@@ -510,7 +645,10 @@ function DataManagementPage() {
                                     </Button>
                                     <Button
                                         onClick={executeImport}
-                                        disabled={importMutation.isPending}
+                                        disabled={
+                                            importMutation.isPending ||
+                                            (selectedDataset === "product_suppliers" && invalidProductSupplierRows.length > 0)
+                                        }
                                         size="sm"
                                         className="gap-2 bg-primary font-medium text-primary-foreground"
                                     >
@@ -558,6 +696,64 @@ function DataManagementPage() {
                                     </tr>
                                 ))}
                             </DataTable>
+
+                            {selectedDataset === "product_suppliers" && (
+                                <div className="mt-6 space-y-3">
+                                    <div>
+                                        <h4 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                                            Workspace Product & Supplier Match
+                                        </h4>
+                                        <p className="mt-1 text-xs text-muted-foreground">
+                                            Records below were resolved only within the active workspace. Blank relationship cost and lead time use the matching Product Master unit cost and Supplier Scorecard lead time. These defaults do not update either master record.
+                                        </p>
+                                    </div>
+                                    <DataTable headers={["Row", "Product", "Supplier", "Relationship Cost", "Lead Time", "MOQ", "Primary", "Existing Primary"]}>
+                                        {(mappingPreview ?? []).slice(0, 20).map((item) => (
+                                            <tr key={item.row} className="border-t border-border/60">
+                                                <td className="px-3.5 py-2.5 text-xs">{item.row}</td>
+                                                <td className="px-3.5 py-2.5 text-xs">
+                                                    {item.product
+                                                        ? <><span className="font-semibold">{item.product.sku}</span><span className="block text-muted-foreground">{item.product.name}</span></>
+                                                        : <span className="text-rose-700">SKU {item.sku || "—"} not found</span>}
+                                                </td>
+                                                <td className="px-3.5 py-2.5 text-xs">
+                                                    {item.supplier
+                                                        ? <><span className="font-semibold">{item.supplier.code}</span><span className="block text-muted-foreground">{item.supplier.name}</span></>
+                                                        : <span className="text-rose-700">Supplier {item.supplierCode || "—"} not found</span>}
+                                                </td>
+                                                <td className="num px-3.5 py-2.5 text-xs">{String(item.relationshipUnitCost ?? "—")}</td>
+                                                <td className="num px-3.5 py-2.5 text-xs">{String(item.relationshipLeadTimeDays ?? "—")}</td>
+                                                <td className="num px-3.5 py-2.5 text-xs">{String(item.moq ?? "—")}</td>
+                                                <td className="px-3.5 py-2.5 text-xs">{String(item.isPrimary ?? "—")}</td>
+                                                <td className="px-3.5 py-2.5 text-xs">
+                                                    {item.currentPrimarySupplier
+                                                        ? `${item.currentPrimarySupplier.code} · ${item.currentPrimarySupplier.name}`
+                                                        : "None"}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </DataTable>
+                                    {(mappingPreview?.length ?? 0) > 20 && (
+                                        <p className="text-xs text-muted-foreground">
+                                            Showing the first 20 of {mappingPreview?.length} resolved rows.
+                                        </p>
+                                    )}
+                                    <div className={`rounded-lg border p-3 text-xs ${invalidProductSupplierRows.length > 0 ? "border-amber-300 bg-amber-50 text-amber-900" : "border-emerald-200 bg-emerald-50 text-emerald-900"}`}>
+                                        <p className="font-semibold">
+                                            Preflight: {mappingPreview?.length ?? 0} rows · {(mappingPreview?.length ?? 0) - invalidProductSupplierRows.length} valid · {invalidProductSupplierRows.length} invalid · {pct(((mappingPreview?.length ?? 0) - invalidProductSupplierRows.length) / Math.max(1, mappingPreview?.length ?? 0) * 100)} quality
+                                        </p>
+                                        {invalidProductSupplierRows.length > 0 && (
+                                            <div className="mt-2 space-y-1">
+                                                {invalidProductSupplierRows.flatMap((item) =>
+                                                    item.errors.map((message, index) => (
+                                                        <p key={`${item.row}-${index}`}>Row {item.row}: {message}</p>
+                                                    )),
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
                         </Panel>
                     )}
 
@@ -632,6 +828,60 @@ function DataManagementPage() {
                                 </tr>
                             ))}
                         </DataTable>
+                    </Panel>
+                    <Panel
+                        title="System Event Stream"
+                        description="Workspace-scoped domain events audited in PostgreSQL and projected by Kafka consumers."
+                        className="mt-6"
+                        actions={
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                className="gap-2 text-xs"
+                                disabled={retryEventsMutation.isPending || !eventQuery.data?.some((event) =>
+                                    event.processing_status === "PENDING" || event.processing_status === "FAILED",
+                                )}
+                                onClick={() => retryEventsMutation.mutate()}
+                            >
+                                <RefreshCw className={`size-3.5 ${retryEventsMutation.isPending ? "animate-spin" : ""}`} />
+                                Retry Pending Events
+                            </Button>
+                        }
+                    >
+                        {eventQuery.data?.[0] && !eventQuery.data[0].consumerStatusAvailable ? (
+                            <div className="mb-3 rounded border border-amber-300 bg-amber-50/70 p-3 text-xs text-amber-900">
+                                Kafka consumer status is unavailable; displayed status reflects PostgreSQL event delivery state only.
+                            </div>
+                        ) : null}
+                        {eventQuery.isError ? (
+                            <div role="alert" className="rounded border border-amber-300 bg-amber-50/70 p-3 text-xs text-amber-900">
+                                Event history is unavailable: {eventQuery.error.message}. Apply the domain-events database migration and ensure Kafka is configured.
+                            </div>
+                        ) : eventQuery.isLoading ? (
+                            <p className="text-xs text-muted-foreground">Loading workspace event history…</p>
+                        ) : eventQuery.data?.length ? (
+                            <DataTable headers={["Event Type", "Entity", "Workspace", "Timestamp", "Processing Status", "Details"]}>
+                                {eventQuery.data.map((event) => {
+                                    const status = event.consumerStatus?.status ?? event.processing_status;
+                                    return (
+                                        <tr key={event.event_id} className="border-t border-border/60">
+                                            <td className="px-3.5 py-2.5 font-mono text-xs font-semibold text-foreground">{event.event_type}</td>
+                                            <td className="px-3.5 py-2.5 text-xs text-muted-foreground">
+                                                {event.entity_type}{event.entity_id ? ` · ${event.entity_id.slice(0, 8)}` : ""}
+                                            </td>
+                                            <td className="px-3.5 py-2.5 font-mono text-[10px] text-muted-foreground">{event.workspace_id}</td>
+                                            <td className="px-3.5 py-2.5 text-xs text-muted-foreground">{dateLabel(event.created_at)}</td>
+                                            <td className="px-3.5 py-2.5"><StatusPill value={status} /></td>
+                                            <td className="px-3.5 py-2.5 max-w-sm truncate text-xs text-muted-foreground">
+                                                {event.consumerStatus?.error ?? event.error_message ?? event.consumerStatus?.processedAt ?? event.published_at ?? "Awaiting Kafka delivery"}
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                            </DataTable>
+                        ) : (
+                            <p className="text-xs text-muted-foreground">No domain events have been recorded for this workspace yet.</p>
+                        )}
                     </Panel>
                 </TabsContent>
             </Tabs>

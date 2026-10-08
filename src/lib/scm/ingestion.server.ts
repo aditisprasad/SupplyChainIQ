@@ -5,7 +5,7 @@ import { normalizeDateToIso, normalizeExcelDateToMonth } from "./date-normalizat
 
 export interface ImportRowError {
     row: number;
-    stage: "validation" | "purchase_orders" | "purchase_order_lines" | "shipments";
+    stage: "validation" | "product_suppliers" | "purchase_orders" | "purchase_order_lines" | "shipments";
     code?: string;
     message: string;
     details?: string;
@@ -117,6 +117,19 @@ async function finishImportRecord(
     }
 
     return mapImportRecord(data);
+}
+
+async function flushImportEvents(client: SupabaseClient, workspaceId: string, importId: string) {
+    try {
+        const { retryPendingDomainEvents } = await import("../kafka/producer.server");
+        await retryPendingDomainEvents(client, workspaceId);
+    } catch (error) {
+        console.error("[domain-events] Import events remain queued for retry", {
+            workspaceId,
+            importId,
+            message: error instanceof Error ? error.message : String(error),
+        });
+    }
 }
 
 function mapImportRecord(data: {
@@ -336,6 +349,191 @@ export async function executeDatasetImport(
                 else validCount++;
             } catch {
                 errorCount++;
+            }
+        }
+    } else if (dataset === "product_suppliers") {
+        const [{ data: products, error: productsError }, { data: suppliers, error: suppliersError }, { data: existingMappings, error: mappingsError }] =
+            await Promise.all([
+                client.from("products").select("id,sku,unit_cost").eq("workspace_id", workspaceId),
+                client.from("suppliers").select("id,code,lead_time_days").eq("workspace_id", workspaceId),
+                client.from("product_suppliers").select("product_id,supplier_id,is_primary").eq("workspace_id", workspaceId),
+            ]);
+        assertLookupSucceeded("Products", productsError);
+        assertLookupSucceeded("Suppliers", suppliersError);
+        assertLookupSucceeded("Product-supplier mappings", mappingsError);
+
+        const productMap = new Map((products ?? []).map((product) => [product.sku, product]));
+        const supplierMap = new Map((suppliers ?? []).map((supplier) => [supplier.code, supplier]));
+        const candidates: Array<{
+            rowIndex: number;
+            productId: string;
+            supplierId: string;
+            sku: string;
+            supplierCode: string;
+            unitCost: number;
+            leadTimeDays: number;
+            moq: number;
+            isPrimary: boolean;
+        }> = [];
+        const invalidRows = new Set<number>();
+        const duplicatePairs = new Map<string, number[]>();
+        const primaryRowsByProduct = new Map<string, number[]>();
+
+        for (const [rowIndex, row] of rows.entries()) {
+            try {
+                const sku = String(row["sku"] ?? "").trim();
+                const supplierCode = String(row["supplier_code"] ?? "").trim();
+                const product = productMap.get(sku);
+                const supplier = supplierMap.get(supplierCode);
+                if (!sku) throw new Error("SKU is required.");
+                if (!supplierCode) throw new Error("Supplier Code is required.");
+                if (!product) throw new Error(`SKU ${sku} was not found in this workspace.`);
+                if (!supplier) throw new Error(`Supplier Code ${supplierCode} was not found in this workspace.`);
+
+                const unitCostRaw = row["unit_cost"];
+                const unitCost = unitCostRaw === undefined || unitCostRaw === ""
+                    ? Number(product.unit_cost)
+                    : Number(unitCostRaw);
+                if (!Number.isFinite(unitCost) || unitCost < 0) {
+                    throw new Error("Relationship Unit Cost must be a valid non-negative number.");
+                }
+                if (Math.round(unitCost * 100) !== unitCost * 100) {
+                    throw new Error("Relationship Unit Cost must have no more than two decimal places.");
+                }
+
+                const leadTimeRaw = row["lead_time_days"];
+                const leadTimeDays = leadTimeRaw === undefined || leadTimeRaw === ""
+                    ? supplier.lead_time_days
+                    : Number(leadTimeRaw);
+                if (!Number.isSafeInteger(leadTimeDays) || leadTimeDays < 0 || leadTimeDays > 2_147_483_647) {
+                    throw new Error("Relationship Lead Time must be a non-negative whole number of days.");
+                }
+
+                const moqRaw = row["moq"];
+                const moq = moqRaw === undefined || moqRaw === "" ? Number.NaN : Number(moqRaw);
+                if (!Number.isSafeInteger(moq) || moq < 0 || moq > 2_147_483_647) {
+                    throw new Error("MOQ must be a non-negative whole number.");
+                }
+
+                const primaryRaw = row["is_primary"];
+                const primaryValue = typeof primaryRaw === "boolean"
+                    ? String(primaryRaw)
+                    : String(primaryRaw ?? "").trim().toLowerCase();
+                const primaryValues: Record<string, boolean> = {
+                    true: true,
+                    yes: true,
+                    y: true,
+                    "1": true,
+                    false: false,
+                    no: false,
+                    n: false,
+                    "0": false,
+                };
+                if (!(primaryValue in primaryValues)) {
+                    throw new Error("Is Primary must be true/false, yes/no, or 1/0.");
+                }
+                const isPrimary = primaryValues[primaryValue];
+                const candidate = {
+                    rowIndex,
+                    productId: product.id,
+                    supplierId: supplier.id,
+                    sku,
+                    supplierCode,
+                    unitCost,
+                    leadTimeDays,
+                    moq,
+                    isPrimary,
+                };
+                candidates.push(candidate);
+
+                const pairKey = `${candidate.productId}:${candidate.supplierId}`;
+                duplicatePairs.set(pairKey, [...(duplicatePairs.get(pairKey) ?? []), rowIndex]);
+                if (isPrimary) {
+                    primaryRowsByProduct.set(candidate.productId, [
+                        ...(primaryRowsByProduct.get(candidate.productId) ?? []),
+                        rowIndex,
+                    ]);
+                }
+            } catch (error) {
+                errorCount++;
+                invalidRows.add(rowIndex);
+                addRowError(rowIndex + 1, "validation", error);
+            }
+        }
+
+        for (const [pairKey, rowIndexes] of duplicatePairs) {
+            if (rowIndexes.length < 2) continue;
+            for (const rowIndex of rowIndexes) {
+                if (invalidRows.has(rowIndex)) continue;
+                invalidRows.add(rowIndex);
+                errorCount++;
+                addRowError(
+                    rowIndex + 1,
+                    "validation",
+                    new Error("The import contains this SKU and Supplier Code more than once."),
+                );
+            }
+            duplicatePairs.delete(pairKey);
+        }
+
+        for (const [productId, rowIndexes] of primaryRowsByProduct) {
+            if (rowIndexes.length < 2) continue;
+            const product = (products ?? []).find((item) => item.id === productId);
+            for (const rowIndex of rowIndexes) {
+                if (invalidRows.has(rowIndex)) continue;
+                invalidRows.add(rowIndex);
+                errorCount++;
+                addRowError(
+                    rowIndex + 1,
+                    "validation",
+                    new Error(`Only one primary supplier can be imported for SKU ${product?.sku ?? "in this row"}.`),
+                );
+            }
+        }
+
+        const existingPrimaryByProduct = new Map<string, string>();
+        for (const mapping of existingMappings ?? []) {
+            if (mapping.is_primary) existingPrimaryByProduct.set(mapping.product_id, mapping.supplier_id);
+        }
+
+        for (const candidate of candidates) {
+            if (invalidRows.has(candidate.rowIndex)) continue;
+            const existingPrimarySupplierId = existingPrimaryByProduct.get(candidate.productId);
+            if (candidate.isPrimary && existingPrimarySupplierId && existingPrimarySupplierId !== candidate.supplierId) {
+                for (const affected of candidates.filter((item) => item.productId === candidate.productId)) {
+                    if (invalidRows.has(affected.rowIndex)) continue;
+                    invalidRows.add(affected.rowIndex);
+                    errorCount++;
+                    addRowError(
+                        affected.rowIndex + 1,
+                        "validation",
+                        new Error(
+                            `SKU ${candidate.sku} already has a different primary supplier. Importing a replacement is not supported; resolve the existing mapping through an approved process first.`,
+                        ),
+                    );
+                }
+            }
+        }
+
+        for (const candidate of candidates) {
+            if (invalidRows.has(candidate.rowIndex)) continue;
+            const { error } = await client.from("product_suppliers").upsert(
+                {
+                    workspace_id: workspaceId,
+                    product_id: candidate.productId,
+                    supplier_id: candidate.supplierId,
+                    unit_cost: candidate.unitCost,
+                    lead_time_days: candidate.leadTimeDays,
+                    moq: candidate.moq,
+                    is_primary: candidate.isPrimary,
+                } as never,
+                { onConflict: "product_id,supplier_id" },
+            );
+            if (error) {
+                errorCount++;
+                addRowError(candidate.rowIndex + 1, "product_suppliers", error);
+            } else {
+                validCount++;
             }
         }
     } else if (dataset === "inventory_positions") {
@@ -612,6 +810,8 @@ export async function executeDatasetImport(
         status,
     });
 
+    await flushImportEvents(client, workspaceId, importedRecord.id);
+
     return {
         success: status === "COMPLETED",
         validCount,
@@ -625,12 +825,13 @@ export async function executeDatasetImport(
         if (errorCount === 0) errorCount = Math.max(0, rows.length - validCount);
         const status = getImportStatus(rows.length, validCount);
         const qualityScore = Math.round((validCount / Math.max(1, rows.length)) * 100 * 10) / 10;
-        await finishImportRecord(client, workspaceId, auditRecord.id, {
+        const failedImportRecord = await finishImportRecord(client, workspaceId, auditRecord.id, {
             validCount,
             errorCount,
             qualityScore,
             status,
         });
+        await flushImportEvents(client, workspaceId, failedImportRecord.id);
         throw error;
     }
 }

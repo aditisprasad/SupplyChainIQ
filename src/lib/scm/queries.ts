@@ -14,6 +14,7 @@ import {
   fetchImportHistory,
   fetchProcurementIntelligence,
   fetchAiDecisionIntelligence,
+  fetchDomainEvents,
   fetchRecommendations,
   globalSearch,
 } from "./scm.functions";
@@ -80,6 +81,11 @@ export const importHistoryQuery = queryOptions({
   queryFn: () => fetchImportHistory(),
 });
 
+export const domainEventsQuery = queryOptions({
+  queryKey: ["scm", "domain-events"],
+  queryFn: () => fetchDomainEvents(),
+});
+
 export const procurementIntelligenceQuery = queryOptions({
   queryKey: ["scm", "procurement-intelligence"],
   queryFn: () => fetchProcurementIntelligence(),
@@ -100,5 +106,4 @@ export const workspacesQuery = queryOptions({
   queryFn: () => fetchWorkspaces(),
   staleTime: 60_000,
 });
-
 

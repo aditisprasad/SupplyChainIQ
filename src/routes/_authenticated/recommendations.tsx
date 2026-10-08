@@ -1,6 +1,8 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useSuspenseQuery } from "@tanstack/react-query";
+import { useMutation, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
 import { useState } from "react";
+import { toast } from "sonner";
 import {
     Sparkles,
     Filter,
@@ -21,6 +23,7 @@ import {
 } from "@/components/scm/primitives";
 import { Button } from "@/components/ui/button";
 import { inventoryQuery, recommendationsQuery } from "@/lib/scm/queries";
+import { approveReplenishmentRecommendation } from "@/lib/scm/scm.functions";
 
 export const Route = createFileRoute("/_authenticated/recommendations")({
     head: () => ({
@@ -45,6 +48,17 @@ export const Route = createFileRoute("/_authenticated/recommendations")({
 function RecommendationsPage() {
     const { data: recs } = useSuspenseQuery(recommendationsQuery);
     const { data: inventory } = useSuspenseQuery(inventoryQuery);
+    const queryClient = useQueryClient();
+    const approveRecommendation = useServerFn(approveReplenishmentRecommendation);
+    const approvalMutation = useMutation({
+        mutationFn: (input: { recommendationId: string; inventoryPositionId: string }) =>
+            approveRecommendation({ data: input }),
+        onSuccess: async (result) => {
+            await queryClient.invalidateQueries({ queryKey: ["scm"] });
+            toast.success(`Recommendation approved; ${result.poNumber} created.`);
+        },
+        onError: (error: Error) => toast.error(`Recommendation approval failed: ${error.message}`),
+    });
 
     const [filterPriority, setFilterPriority] = useState<string>("ALL");
 
@@ -138,7 +152,7 @@ function RecommendationsPage() {
                 {filteredRecs.length === 0 ? (
                     <EmptyState title="No recommendations generated from current records." description="No matching rows were returned by the current recommendation rules." />
                 ) : (
-                    <DataTable headers={["Recommendation", "Category", "Priority", "Target", "Estimated Impact"]}>
+                    <DataTable headers={["Recommendation", "Category", "Priority", "Target", "Estimated Impact", "Action"]}>
                         {filteredRecs.map((r) => (
                             <tr key={r.id} className="border-t border-border/60 hover:bg-muted/40 transition-colors">
                                 <td className="px-3.5 py-3">
@@ -152,6 +166,22 @@ function RecommendationsPage() {
                                 <td className="num px-3.5 py-3 text-xs font-semibold text-foreground">{r.sku}</td>
                                 <td className="num px-3.5 py-3 font-bold text-primary">{usd(r.impactUsd)}</td>
                                 <td className="px-3.5 py-3">
+                                    {r.category === "REPLENISHMENT" && r.inventoryPositionId ? (
+                                        <Button
+                                            size="sm"
+                                            className="h-7 gap-1.5 text-[11px] font-bold"
+                                            disabled={approvalMutation.isPending}
+                                            onClick={() => approvalMutation.mutate({
+                                                recommendationId: r.id,
+                                                inventoryPositionId: r.inventoryPositionId!,
+                                            })}
+                                        >
+                                            <CheckCircle className="size-3" />
+                                            Approve & Create PO
+                                        </Button>
+                                    ) : (
+                                        <span className="text-xs text-muted-foreground">No automated action</span>
+                                    )}
                                 </td>
                             </tr>
                         ))}
@@ -161,4 +191,3 @@ function RecommendationsPage() {
         </>
     );
 }
-

@@ -169,6 +169,10 @@ export function Panel({
 }
 
 const TONES: Record<string, string> = {
+  PENDING: "bg-amber-100/80 text-amber-800 border-amber-300/80",
+  PUBLISHED: "bg-sky-100/80 text-sky-800 border-sky-300/80",
+  PROCESSED: "bg-emerald-100/70 text-emerald-800 border-emerald-300/80",
+  FAILED: "bg-rose-100/80 text-rose-800 border-rose-300/80",
   HEALTHY: "bg-emerald-100/70 text-emerald-800 border-emerald-300/80",
   DELIVERED: "bg-emerald-100/70 text-emerald-800 border-emerald-300/80",
   ACTIVE: "bg-emerald-100/70 text-emerald-800 border-emerald-300/80",
@@ -320,4 +324,3 @@ export function PageSkeleton({ kpis = 4, panels = 2 }: { kpis?: number; panels?:
     </div>
   );
 }
-

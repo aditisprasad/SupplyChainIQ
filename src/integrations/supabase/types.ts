@@ -70,6 +70,56 @@ export type Database = {
           },
         ]
       }
+      domain_events: {
+        Row: {
+          created_at: string
+          entity_id: string | null
+          entity_type: string
+          error_message: string | null
+          event_id: string
+          event_type: string
+          payload: Json
+          processing_status: string
+          published_at: string | null
+          source: string
+          workspace_id: string
+        }
+        Insert: {
+          created_at?: string
+          entity_id?: string | null
+          entity_type: string
+          error_message?: string | null
+          event_id: string
+          event_type: string
+          payload?: Json
+          processing_status?: string
+          published_at?: string | null
+          source?: string
+          workspace_id: string
+        }
+        Update: {
+          created_at?: string
+          entity_id?: string | null
+          entity_type?: string
+          error_message?: string | null
+          event_id?: string
+          event_type?: string
+          payload?: Json
+          processing_status?: string
+          published_at?: string | null
+          source?: string
+          workspace_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "domain_events_workspace_id_fkey"
+            columns: ["workspace_id"]
+            isOneToOne: false
+            referencedRelation: "workspaces"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       demand_forecasts: {
         Row: {
           actual_units: number | null

@@ -186,6 +186,7 @@ export async function receivePurchaseOrder(
   if (lines.error) throw new Error(lines.error.message);
 
   let unitsReceived = 0;
+  const inventoryPositionIds: string[] = [];
   for (const line of lines.data ?? []) {
     const outstanding = line.quantity_units - line.received_units;
     if (outstanding <= 0) continue;
@@ -216,6 +217,7 @@ export async function receivePurchaseOrder(
       })
       .eq("id", pos.data.id);
     if (move.error) throw new Error(move.error.message);
+    inventoryPositionIds.push(pos.data.id);
   }
 
   const close = await db
@@ -227,7 +229,12 @@ export async function receivePurchaseOrder(
   if (close.error) throw new Error(close.error.message);
   if (!close.data) throw new Error("Purchase order could not be updated");
 
-  return { poNumber: close.data.po_number, unitsReceived };
+  return {
+    purchaseOrderId: po.data.id,
+    poNumber: close.data.po_number,
+    unitsReceived,
+    inventoryPositionIds,
+  };
 }
 
 // ------------------------------------------------------------- CSV EXPORT

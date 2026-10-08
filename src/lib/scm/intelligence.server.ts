@@ -873,7 +873,13 @@ export async function setAlertStatus(
 // -------------------------------------------------------- REPLENISHMENT PO
 export async function createReplenishmentOrder(
   db: Db,
-  input: { workspaceId: string; inventoryPositionId: string; quantityUnits: number; userId: string },
+  input: {
+    workspaceId: string;
+    inventoryPositionId: string;
+    quantityUnits: number;
+    userId: string;
+    status?: "OPEN" | "APPROVED";
+  },
 ) {
   const position = await db
     .from("inventory_positions")
@@ -914,7 +920,7 @@ export async function createReplenishmentOrder(
       po_number: poNumber,
       supplier_id: sourcing.data.supplier_id,
       site_id: position.data.site_id,
-      status: "OPEN",
+      status: input.status ?? "OPEN",
       order_date: orderDate.toISOString().slice(0, 10),
       promised_date: promised.toISOString().slice(0, 10),
       total_value_usd: totalValue,
@@ -944,10 +950,14 @@ export async function createReplenishmentOrder(
   if (bump.error) throw new Error(bump.error.message);
 
   return {
+    id: po.data.id,
     poNumber: po.data.po_number,
     promisedDate: po.data.promised_date,
     totalValueUsd: Number(po.data.total_value_usd),
     quantityUnits: orderQuantity,
+    inventoryPositionId: position.data.id,
+    productId: position.data.product_id,
+    siteId: position.data.site_id,
   };
 }
 
@@ -1274,6 +1284,8 @@ export async function getRecommendations(db: Db, workspaceId: string) {
     impactUsd: number;
     sku: string;
     detail: string;
+    inventoryPositionId?: string;
+    suggestedOrderUnits?: number;
   }> = [];
 
   let idx = 1;
@@ -1293,6 +1305,8 @@ export async function getRecommendations(db: Db, workspaceId: string) {
           impactUsd: impact,
           sku: p.sku,
           detail: `On-hand stock at ${s.code} is ${r.on_hand_units} units (safety target: ${r.safety_stock_units} units). Issue emergency PO line.`,
+          inventoryPositionId: r.id,
+          suggestedOrderUnits: Math.max(1, r.reorder_point_units - r.on_hand_units),
         });
       }
     }
